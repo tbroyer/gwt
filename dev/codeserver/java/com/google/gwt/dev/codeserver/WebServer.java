@@ -23,33 +23,27 @@ import com.google.gwt.dev.codeserver.CompileDir.PolicyFile;
 import com.google.gwt.dev.codeserver.Pages.ErrorPage;
 import com.google.gwt.dev.json.JsonObject;
 
-import org.eclipse.jetty.http.MimeTypes;
-import org.eclipse.jetty.server.HttpConnection;
-import org.eclipse.jetty.server.Request;
-import org.eclipse.jetty.server.Server;
-import org.eclipse.jetty.server.ServerConnector;
-import org.eclipse.jetty.servlet.ServletContextHandler;
-import org.eclipse.jetty.servlet.ServletHolder;
+import com.google.gwt.thirdparty.guava.common.base.Splitter;
+import com.sun.net.httpserver.HttpExchange;
+import com.sun.net.httpserver.HttpHandler;
+import com.sun.net.httpserver.HttpServer;
+import java.io.PrintWriter;
+import java.net.InetSocketAddress;
 
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileReader;
 import java.io.IOException;
 import java.io.InputStream;
-import java.util.Date;
-import java.util.EnumSet;
+import java.net.URLConnection;
+import java.net.URLDecoder;
+import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutionException;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
-
-import javax.servlet.DispatcherType;
-import javax.servlet.ServletException;
-import javax.servlet.http.HttpServlet;
-import javax.servlet.http.HttpServletRequest;
-import javax.servlet.http.HttpServletResponse;
 
 /**
  * The web server for Super Dev Mode, also known as the code server. The URLs handled include:
@@ -86,10 +80,6 @@ public class WebServer {
 
   private static final Pattern CACHE_JS_FILE = Pattern.compile("/(" + STRONG_NAME + ").cache.js$");
 
-  private static final MimeTypes MIME_TYPES = new MimeTypes();
-
-  private static final String TIME_IN_THE_PAST = "Mon, 01 Jan 1990 00:00:00 GMT";
-
   private final SourceHandler sourceHandler;
   private final SymbolMapHandler symbolMapHandler;
   private final JsonExporter jsonExporter;
@@ -100,7 +90,7 @@ public class WebServer {
   private final String bindAddress;
   private final int port;
 
-  private Server server;
+  private HttpServer server;
 
   WebServer(SourceHandler handler, SymbolMapHandler symbolMapHandler, JsonExporter jsonExporter,
       OutboxTable outboxTable, JobRunner runner, JobEventTable eventTable, String bindAddress,
@@ -116,31 +106,22 @@ public class WebServer {
   }
 
   void start(final TreeLogger logger) throws UnableToCompleteException {
-
-    Server newServer = new Server();
-    ServerConnector connector = new ServerConnector(newServer);
-    connector.setHost(bindAddress);
-    connector.setPort(port);
-    connector.setReuseAddress(true);
-    newServer.addConnector(connector);
-
-    ServletContextHandler newHandler = new ServletContextHandler(ServletContextHandler.GZIP);
-    newHandler.setContextPath("/");
-    newHandler.addServlet(new ServletHolder(new HttpServlet() {
-      @Override
-      protected void doGet(HttpServletRequest request, HttpServletResponse response)
-          throws ServletException, IOException {
-        handleRequest(request.getPathInfo(), request, response, logger);
-      }
-    }), "/*");
-    newServer.setHandler(newHandler);
+    HttpServer server;
     try {
-      newServer.start();
-    } catch (Exception e) {
-      logger.log(TreeLogger.ERROR, "cannot start web server", e);
+      server = HttpServer.create(new InetSocketAddress(bindAddress, port), 0);
+    } catch (IOException e) {
+      logger.log(TreeLogger.ERROR, "cannot create web server", e);
       throw new UnableToCompleteException();
     }
-    this.server = newServer;
+    // XXX: handle gzip?
+    server.createContext("/", new HttpHandler() {
+      @Override
+      public void handle(HttpExchange exchange) throws IOException {
+        handleRequest(exchange.getRequestURI().getPath(), exchange, logger);
+      }
+    });
+    server.start();
+    this.server = server;
   }
 
   public int getPort() {
@@ -148,7 +129,7 @@ public class WebServer {
   }
 
   public void stop() throws Exception {
-    server.stop();
+    server.stop(3000);
     server = null;
   }
 
@@ -160,37 +141,28 @@ public class WebServer {
     return outboxTable.findByOutputModuleName(outputModuleName).getWarDir();
   }
 
-  private void handleRequest(String target, HttpServletRequest request,
-      HttpServletResponse response, TreeLogger parentLogger)
+  private void handleRequest(String target, HttpExchange exchange, TreeLogger parentLogger)
       throws IOException {
 
-    if (request.getMethod().equalsIgnoreCase("get")) {
+    if (exchange.getRequestMethod().equalsIgnoreCase("get")) {
 
       TreeLogger logger = parentLogger.branch(Type.TRACE, "GET " + target);
 
-      Response page = doGet(target, request, logger);
+      Response page = doGet(target, exchange, logger);
       if (page == null) {
         logger.log(Type.WARN, "not handled: " + target);
         return;
       }
 
-      setHandled(request);
-      if (!target.endsWith(".cache.js")) {
-        // Make sure IE9 doesn't cache any pages.
-        // (Nearly all pages may change on server restart.)
-        response.setHeader("Cache-Control", "no-cache, no-store, max-age=0, must-revalidate");
-        response.setHeader("Pragma", "no-cache");
-        response.setHeader("Expires", TIME_IN_THE_PAST);
-        response.setDateHeader("Date", new Date().getTime());
-      }
-      page.send(request, response, logger);
+      exchange.getResponseHeaders().set("Cache-Control", target.endsWith(".cache.js") ? "immutable" : "no-cache");
+      page.send(exchange, logger);
     }
   }
 
   /**
    * Returns the page that should be sent in response to a GET request, or null for no response.
    */
-  private Response doGet(String target, HttpServletRequest request, TreeLogger logger)
+  private Response doGet(String target, HttpExchange request, TreeLogger logger)
       throws IOException {
 
     if (target.equals("/")) {
@@ -363,26 +335,25 @@ public class WebServer {
     // Wrap the response to send the extra headers.
     return new Response() {
       @Override
-      public void send(HttpServletRequest request, HttpServletResponse response, TreeLogger logger)
+      public void send(HttpExchange exchange, TreeLogger logger)
           throws IOException {
-        // TODO: why do we need this? Looks like Ray added it a long time ago.
-        response.setHeader("Access-Control-Allow-Origin", "*");
+        exchange.getResponseHeaders().set("Access-Control-Allow-Origin", "*");
 
         if (sourceMapUrl != null) {
-          response.setHeader("X-SourceMap", sourceMapUrl);
-          response.setHeader("SourceMap", sourceMapUrl);
+          exchange.getResponseHeaders().set("SourceMap", sourceMapUrl);
         }
 
         if (contentEncoding != null) {
-          if (!request.getHeader("Accept-Encoding").contains("gzip")) {
-            response.sendError(HttpServletResponse.SC_NOT_IMPLEMENTED);
+          if (!exchange.getRequestHeaders().getFirst("Accept-Encoding").contains("gzip")) {
+            exchange.sendResponseHeaders(501, -1);
+            exchange.close();
             logger.log(TreeLogger.WARN, "client doesn't accept gzip; bailing");
             return;
           }
-          response.setHeader("Content-Encoding", "gzip");
+          exchange.getResponseHeaders().set("Content-Encoding", "gzip");
         }
 
-        barePage.send(request, response, logger);
+        barePage.send(exchange, logger);
       }
     };
   }
@@ -402,54 +373,56 @@ public class WebServer {
     return new Response() {
 
       @Override
-      public void send(HttpServletRequest request, HttpServletResponse response, TreeLogger logger)
-          throws IOException {
-        response.setContentType("text/html");
+      public void send(HttpExchange exchange, TreeLogger logger) throws IOException {
+        exchange.getResponseHeaders().set("Content-Type", "text/html; charset=utf-8");
+        exchange.sendResponseHeaders(200, 0);
 
-        HtmlWriter out = new HtmlWriter(response.getWriter());
+        try (var writer = new PrintWriter(exchange.getResponseBody(), false, StandardCharsets.UTF_8)) {
+          HtmlWriter out = new HtmlWriter(writer);
 
-        out.startTag("html").nl();
-        out.startTag("head").nl();
-        out.startTag("title").text("Policy Files").endTag("title").nl();
-        out.endTag("head");
-        out.startTag("body");
+          out.startTag("html").nl();
+          out.startTag("head").nl();
+          out.startTag("title").text("Policy Files").endTag("title").nl();
+          out.endTag("head");
+          out.startTag("body");
 
-        out.startTag("h1").text("Policy Files").endTag("h1").nl();
+          out.startTag("h1").text("Policy Files").endTag("h1").nl();
 
-        for (Outbox box : outboxTable.getOutboxes()) {
-          List<PolicyFile> policies = box.readRpcPolicyManifest();
-          if (!policies.isEmpty()) {
-            out.startTag("h2").text(box.getOutputModuleName()).endTag("h2").nl();
+          for (Outbox box : outboxTable.getOutboxes()) {
+            List<PolicyFile> policies = box.readRpcPolicyManifest();
+            if (!policies.isEmpty()) {
+              out.startTag("h2").text(box.getOutputModuleName()).endTag("h2").nl();
 
-            out.startTag("table").nl();
-            for (PolicyFile policy : policies) {
+              out.startTag("table").nl();
+              for (PolicyFile policy : policies) {
 
-              out.startTag("tr");
+                out.startTag("tr");
 
-              out.startTag("td");
+                out.startTag("td");
 
-              out.startTag("a", "href=", policy.getServiceSourceUrl());
-              out.text(policy.getServiceName());
-              out.endTag("a");
+                out.startTag("a", "href=", policy.getServiceSourceUrl());
+                out.text(policy.getServiceName());
+                out.endTag("a");
 
-              out.endTag("td");
+                out.endTag("td");
 
-              out.startTag("td");
+                out.startTag("td");
 
-              out.startTag("a", "href=", policy.getUrl());
-              out.text(policy.getName());
-              out.endTag("a");
+                out.startTag("a", "href=", policy.getUrl());
+                out.text(policy.getName());
+                out.endTag("a");
 
-              out.endTag("td");
+                out.endTag("td");
 
-              out.endTag("tr").nl();
+                out.endTag("tr").nl();
+              }
+              out.endTag("table").nl();
             }
-            out.endTag("table").nl();
           }
-        }
 
-        out.endTag("body").nl();
-        out.endTag("html").nl();
+          out.endTag("body").nl();
+          out.endTag("html").nl();
+        }
       }
     };
   }
@@ -486,26 +459,29 @@ public class WebServer {
     return new Response() {
 
       @Override
-      public void send(HttpServletRequest request, HttpServletResponse response, TreeLogger logger)
-          throws IOException {
+      public void send(HttpExchange exchange, TreeLogger logger) throws IOException {
         BufferedReader reader = new BufferedReader(new FileReader(file));
 
-        response.setStatus(HttpServletResponse.SC_OK);
-        response.setContentType("text/html");
-        response.setHeader("Content-Style-Type", "text/css");
+        exchange.getResponseHeaders().set("Content-Type", "text/html; charset=utf-8");
+        exchange.sendResponseHeaders(200, 0);
 
-        HtmlWriter out = new HtmlWriter(response.getWriter());
-        out.startTag("html").nl();
-        out.startTag("head").nl();
-        out.startTag("title").text(box.getOutputModuleName() + " compile log").endTag("title").nl();
-        out.startTag("style").nl();
-        out.text(".error { color: red; font-weight: bold; }").nl();
-        out.endTag("style").nl();
-        out.endTag("head").nl();
-        out.startTag("body").nl();
-        sendLogAsHtml(reader, out);
-        out.endTag("body").nl();
-        out.endTag("html").nl();
+        try (var writer = new PrintWriter(exchange.getResponseBody(), false, StandardCharsets.UTF_8)) {
+          HtmlWriter out = new HtmlWriter(writer);
+          out.startTag("html").nl();
+          out.startTag("head").nl();
+          out.startTag("title")
+              .text(box.getOutputModuleName() + " compile log")
+              .endTag("title")
+              .nl();
+          out.startTag("style").nl();
+          out.text(".error { color: red; font-weight: bold; }").nl();
+          out.endTag("style").nl();
+          out.endTag("head").nl();
+          out.startTag("body").nl();
+          sendLogAsHtml(reader, out);
+          out.endTag("body").nl();
+          out.endTag("html").nl();
+        }
       }
     };
   }
@@ -541,7 +517,7 @@ public class WebServer {
 
   /* visible for testing */
   static String guessMimeType(String filename) {
-    String mimeType = MIME_TYPES.getMimeByExtension(filename);
+    String mimeType = URLConnection.getFileNameMap().getContentTypeFor(filename);
     return mimeType != null ? mimeType : "";
   }
 
@@ -549,20 +525,16 @@ public class WebServer {
    * Returns the binding properties from the web page where dev mode is being used. (As passed in
    * by dev_mode_on.js in a JSONP request to "/recompile".)
    */
-  private Map<String, String> getBindingProperties(HttpServletRequest request) {
+  private Map<String, String> getBindingProperties(HttpExchange request) {
+    var rawMap = Splitter.on("&").omitEmptyStrings().withKeyValueSeparator("=")
+        .split(request.getRequestURI().getRawQuery());
     Map<String, String> result = new HashMap<String, String>();
-    for (Object key : request.getParameterMap().keySet()) {
-      String propName = (String) key;
+    for (var entry : rawMap.entrySet()) {
+      String propName = URLDecoder.decode(entry.getKey(), StandardCharsets.UTF_8);
       if (!propName.equals("_callback")) {
-        result.put(propName, request.getParameter(propName));
+        result.put(propName, URLDecoder.decode(entry.getValue(), StandardCharsets.UTF_8));
       }
     }
     return result;
-  }
-
-  private static void setHandled(HttpServletRequest request) {
-    Request baseRequest = (request instanceof Request) ? (Request) request :
-        HttpConnection.getCurrentConnection().getHttpChannel().getRequest();
-    baseRequest.setHandled(true);
   }
 }

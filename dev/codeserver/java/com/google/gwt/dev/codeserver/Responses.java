@@ -19,12 +19,13 @@ package com.google.gwt.dev.codeserver;
 import com.google.gwt.core.ext.TreeLogger;
 import com.google.gwt.dev.codeserver.Pages.ErrorPage;
 import com.google.gwt.dev.json.JsonObject;
-import com.google.gwt.thirdparty.guava.common.base.Charsets;
 import com.google.gwt.thirdparty.guava.common.base.Preconditions;
+import com.google.gwt.thirdparty.guava.common.base.Splitter;
 import com.google.gwt.thirdparty.guava.common.io.ByteStreams;
 import com.google.gwt.thirdparty.guava.common.io.Files;
 import com.google.gwt.thirdparty.guava.common.io.Resources;
 
+import com.sun.net.httpserver.HttpExchange;
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.IOException;
@@ -33,11 +34,9 @@ import java.io.OutputStreamWriter;
 import java.io.PrintWriter;
 import java.io.Writer;
 import java.net.URL;
+import java.net.URLDecoder;
+import java.nio.charset.StandardCharsets;
 import java.util.regex.Pattern;
-
-import javax.servlet.ServletOutputStream;
-import javax.servlet.http.HttpServletRequest;
-import javax.servlet.http.HttpServletResponse;
 
 /**
  * Common HTTP responses other than HTML pages, which are in {@link Pages}.
@@ -57,11 +56,12 @@ public class Responses {
 
     return new Response() {
       @Override
-      public void send(HttpServletRequest request, HttpServletResponse response, TreeLogger logger)
-          throws IOException {
-        response.setStatus(HttpServletResponse.SC_OK);
-        response.setContentType(mimeType);
-        Files.copy(file, response.getOutputStream());
+      public void send(HttpExchange exchange, TreeLogger logger) throws IOException {
+        exchange.getResponseHeaders().set("Content-Type", mimeType);
+        exchange.sendResponseHeaders(200, file.length());
+        try (var os = exchange.getResponseBody()) {
+          Files.copy(file, os);
+        }
       }
     };
   }
@@ -74,31 +74,39 @@ public class Responses {
 
     return new Response() {
       @Override
-      public void send(HttpServletRequest request, HttpServletResponse response, TreeLogger logger)
-          throws IOException {
-        response.setStatus(HttpServletResponse.SC_OK);
-        response.setHeader("Cache-control", "no-cache");
-        PrintWriter out = response.getWriter();
+      public void send(HttpExchange exchange, TreeLogger logger) throws IOException {
+        exchange.getResponseHeaders().set("Cache-control", "no-cache");
+        String callbackExpression = getParameter(exchange.getRequestURI().getRawQuery(), "_callback");
+        exchange.getResponseHeaders().set(
+            "Content-Type", callbackExpression == null ? "application/json" : "application/javascript");
+        exchange.sendResponseHeaders(200, 0);
 
-        String callbackExpression = request.getParameter("_callback");
-        if (callbackExpression == null) {
-          // AJAX
-          response.setContentType("application/json");
-          json.write(out);
-        } else {
-          // JSONP
-          response.setContentType("application/javascript");
-          if (SAFE_CALLBACK.matcher(callbackExpression).matches()) {
-            out.print("/* API response */ " + callbackExpression + "(");
+        try (var out = new PrintWriter(exchange.getResponseBody(), false, StandardCharsets.UTF_8)) {
+          if (callbackExpression == null) {
+            // AJAX
             json.write(out);
-            out.println(");");
           } else {
-            logger.log(TreeLogger.ERROR, "invalid callback: " + callbackExpression);
-            // Notice that we cannot execute the callback
-            out.print("alert('invalid callback parameter');\n");
-            json.write(out);
+            // JSONP
+            if (SAFE_CALLBACK.matcher(callbackExpression).matches()) {
+              out.print("/* API response */ " + callbackExpression + "(");
+              json.write(out);
+              out.println(");");
+            } else {
+              logger.log(TreeLogger.ERROR, "invalid callback: " + callbackExpression);
+              // Notice that we cannot execute the callback
+              out.print("alert('invalid callback parameter');\n");
+              json.write(out);
+            }
           }
         }
+      }
+
+      private String getParameter(String rawQuery, String paramName) {
+        return Splitter.on("&").omitEmptyStrings().withKeyValueSeparator("=").split(rawQuery)
+            .entrySet().stream()
+            .filter(entry -> URLDecoder.decode(entry.getKey(), StandardCharsets.UTF_8).equals(paramName))
+            .map(entry -> URLDecoder.decode(entry.getValue(), StandardCharsets.UTF_8))
+            .findFirst().orElse(null);
       }
     };
   }
@@ -109,15 +117,13 @@ public class Responses {
   static Response newJavascriptResponse(final String jsScript) {
     return new Response() {
       @Override
-      public void send(HttpServletRequest request, HttpServletResponse response, TreeLogger logger)
-          throws IOException {
-        response.setStatus(HttpServletResponse.SC_OK);
-        response.setContentType("application/javascript");
-
-        ServletOutputStream outBytes = response.getOutputStream();
-        Writer out = new OutputStreamWriter(outBytes, "UTF-8");
-        out.write(jsScript);
-        out.close();
+      public void send(HttpExchange exchange, TreeLogger logger) throws IOException {
+        exchange.getResponseHeaders().set("Content-Type", "application/javascript");
+        var bytes = jsScript.getBytes(StandardCharsets.UTF_8);
+        exchange.sendResponseHeaders(200, bytes.length);
+        try (var os = exchange.getResponseBody()) {
+          os.write(bytes);
+        }
       }
     };
   }
@@ -138,20 +144,20 @@ public class Responses {
 
     return new Response() {
       @Override
-      public void send(HttpServletRequest request, HttpServletResponse response, TreeLogger logger)
+      public void send(HttpExchange exchange, TreeLogger logger)
           throws IOException {
-        response.setStatus(HttpServletResponse.SC_OK);
-        response.setContentType("application/javascript");
+        exchange.getResponseHeaders().set("Content-Type", "application/javascript");
+        exchange.sendResponseHeaders(200, 0);
 
-        ServletOutputStream outBytes = response.getOutputStream();
-        Writer out = new OutputStreamWriter(outBytes, "UTF-8");
+        try (var os = exchange.getResponseBody()) {
+          Writer out = new OutputStreamWriter(os, StandardCharsets.UTF_8);
+          out.append("window." + variableName + " = ");
+          json.write(out);
+          out.append(";\n");
+          out.flush();
 
-        out.append("window." + variableName + " = ");
-        json.write(out);
-        out.append(";\n");
-        out.flush();
-
-        Resources.copy(resource, outBytes);
+          Resources.copy(resource, os);
+        }
       }
     };
   }
@@ -169,23 +175,20 @@ public class Responses {
 
     return new Response() {
       @Override
-      public void send(HttpServletRequest request, HttpServletResponse response, TreeLogger logger)
-          throws IOException {
-        BufferedReader reader = Files.newReader(file, Charsets.UTF_8);
-        try {
-          response.setStatus(HttpServletResponse.SC_OK);
-          response.setContentType(mimeType);
-          PrintWriter out = response.getWriter();
-          while (true) {
-            String line = reader.readLine();
-            if (line == null) {
-              break;
+      public void send(HttpExchange exchange, TreeLogger logger) throws IOException {
+        try (BufferedReader reader = Files.newReader(file, StandardCharsets.UTF_8)) {
+          exchange.getResponseHeaders().set("Content-Type", mimeType);
+          exchange.sendResponseHeaders(200, 0);
+          try (var writer = new PrintWriter(exchange.getResponseBody(), false, StandardCharsets.UTF_8)) {
+            while (true) {
+              String line = reader.readLine();
+              if (line == null) {
+                break;
+              }
+              line = line.replace(templateVariable, replacement);
+              writer.println(line);
             }
-            line = line.replace(templateVariable, replacement);
-            out.println(line);
           }
-        } finally {
-          reader.close();
         }
       }
     };
@@ -202,14 +205,15 @@ public class Responses {
       boolean sent = false;
 
       @Override
-      public void send(HttpServletRequest request, HttpServletResponse response, TreeLogger logger)
-          throws IOException {
+      public void send(HttpExchange exchange, TreeLogger logger) throws IOException {
         Preconditions.checkState(!sent);
 
         try {
-          response.setStatus(HttpServletResponse.SC_OK);
-          response.setContentType(mimeType);
-          ByteStreams.copy(pageBytes, response.getOutputStream());
+          exchange.getResponseHeaders().set("Content-Type", mimeType);
+          exchange.sendResponseHeaders(200, 0);
+          try (var os = exchange.getResponseBody()) {
+            ByteStreams.copy(pageBytes, os);
+          }
         } finally {
           pageBytes.close();
         }
@@ -224,10 +228,10 @@ public class Responses {
   static Response newTimedResponse(final Response barePage, final String message) {
     return new Response() {
       @Override
-      public void send(HttpServletRequest request, HttpServletResponse response, TreeLogger logger)
+      public void send(HttpExchange exchange, TreeLogger logger)
           throws IOException {
         long startTime = System.currentTimeMillis();
-        barePage.send(request, response, logger);
+        barePage.send(exchange, logger);
         long elapsedTime = System.currentTimeMillis() - startTime;
         logger.log(TreeLogger.INFO, message + " in " + elapsedTime + " ms");
       }
