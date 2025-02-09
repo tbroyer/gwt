@@ -21,14 +21,13 @@ import com.google.gwt.core.ext.TreeLogger.Type;
 import com.google.gwt.dev.json.JsonObject;
 import com.google.gwt.thirdparty.guava.common.io.Resources;
 
+import com.sun.net.httpserver.HttpExchange;
 import java.io.IOException;
 import java.io.OutputStreamWriter;
+import java.io.PrintWriter;
 import java.io.Writer;
 import java.net.URL;
-
-import javax.servlet.ServletOutputStream;
-import javax.servlet.http.HttpServletRequest;
-import javax.servlet.http.HttpServletResponse;
+import java.nio.charset.StandardCharsets;
 
 /**
  * Common HTTP responses that send HTML pages. For non-HTML pages, see {@link Responses}.
@@ -72,23 +71,23 @@ class Pages {
     }
 
     @Override
-    public void send(HttpServletRequest request, HttpServletResponse response, TreeLogger logger)
-        throws IOException {
-      response.setStatus(HttpServletResponse.SC_OK);
-      response.setContentType("text/html");
+    public void send(HttpExchange exchange, TreeLogger logger) throws IOException {
+      exchange.getResponseHeaders().set("Content-Type", "text/html");
+      exchange.sendResponseHeaders(200, 0);
 
-      ServletOutputStream outBytes = response.getOutputStream();
-      Writer out = new OutputStreamWriter(outBytes, "UTF-8");
+      try (var outBytes = exchange.getResponseBody()) {
+        Writer out = new OutputStreamWriter(outBytes, StandardCharsets.UTF_8);
 
-      out.append("<!DOCTYPE html>\n");
-      out.append("<script>\n");
-      out.append("window." + variableName + " = ");
-      json.write(out);
-      out.append(";\n");
-      out.append("</script>\n");
-      out.flush();
+        out.append("<!DOCTYPE html>\n");
+        out.append("<script>\n");
+        out.append("window." + variableName + " = ");
+        json.write(out);
+        out.append(";\n");
+        out.append("</script>\n");
+        out.flush();
 
-      Resources.copy(resource, outBytes);
+        Resources.copy(resource, outBytes);
+      }
     }
   }
 
@@ -100,7 +99,7 @@ class Pages {
     final String message;
 
     ErrorPage(String message) {
-      this(HttpServletResponse.SC_NOT_FOUND, message);
+      this(404, message);
     }
 
     ErrorPage(int httpStatus, String message) {
@@ -109,24 +108,27 @@ class Pages {
     }
 
     @Override
-    public void send(HttpServletRequest request, HttpServletResponse response, TreeLogger logger)
+    public void send(HttpExchange exchange, TreeLogger logger)
         throws IOException {
 
-      response.setStatus(status);
-      response.setContentType("text/html");
-      HtmlWriter out = new HtmlWriter(response.getWriter());
-      out.startTag("html").nl();
+      exchange.getResponseHeaders().set("Content-Type", "text/html");
+      exchange.sendResponseHeaders(status, 0);
 
-      out.startTag("head").nl();
-      out.startTag("title").text("Unavailable (GWT Code Server)").endTag("title").nl();
-      out.endTag("head").nl();
+      try (var writer =
+          new PrintWriter(exchange.getResponseBody(), false, StandardCharsets.UTF_8)) {
+        HtmlWriter out = new HtmlWriter(writer);
+        out.startTag("html").nl();
 
-      out.startTag("body").nl();
-      out.startTag("p").text(message).endTag("p");
-      out.endTag("body").nl();
+        out.startTag("head").nl();
+        out.startTag("title").text("Unavailable (GWT Code Server)").endTag("title").nl();
+        out.endTag("head").nl();
 
-      out.endTag("html").nl();
+        out.startTag("body").nl();
+        out.startTag("p").text(message).endTag("p");
+        out.endTag("body").nl();
 
+        out.endTag("html").nl();
+      }
       logger.log(Type.INFO, "Sent error page: " + message);
     }
   }

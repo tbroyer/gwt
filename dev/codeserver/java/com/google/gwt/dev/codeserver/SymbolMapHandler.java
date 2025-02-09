@@ -19,11 +19,10 @@ package com.google.gwt.dev.codeserver;
 import com.google.gwt.core.ext.TreeLogger;
 import com.google.gwt.dev.codeserver.Pages.ErrorPage;
 
+import com.sun.net.httpserver.HttpExchange;
 import java.io.File;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
-
-import javax.servlet.http.HttpServletRequest;
 
 /**
  * Serves GWT symbol maps.
@@ -62,7 +61,7 @@ class SymbolMapHandler {
     return getModuleNameFromRequest(target) != null;
   }
 
-  Response handle(String target, HttpServletRequest request, TreeLogger logger) {
+  Response handle(String target, HttpExchange request, TreeLogger logger) {
     String moduleName = getModuleNameFromRequest(target);
     if (moduleName == null) {
       throw new RuntimeException("invalid request (shouldn't happen): " + target);

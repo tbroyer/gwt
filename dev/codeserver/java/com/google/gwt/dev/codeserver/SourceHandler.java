@@ -20,16 +20,16 @@ import com.google.gwt.core.ext.TreeLogger;
 import com.google.gwt.dev.codeserver.Pages.ErrorPage;
 import com.google.gwt.dev.json.JsonObject;
 
+import com.sun.net.httpserver.HttpExchange;
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.io.PrintWriter;
+import java.nio.charset.StandardCharsets;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
-
-import javax.servlet.http.HttpServletRequest;
-import javax.servlet.http.HttpServletResponse;
 
 /**
  * Serves Java source files so that a browser's debugger can display them.
@@ -94,7 +94,7 @@ class SourceHandler {
     return SOURCEMAP_PATH + moduleName + "/__HASH__" + SOURCEMAP_URL_SUFFIX;
   }
 
-  Response handle(String target, HttpServletRequest request, TreeLogger logger)
+  Response handle(String target, HttpExchange request, TreeLogger logger)
       throws IOException {
     String moduleName = getModuleNameFromRequest(target);
     if (moduleName == null) {
@@ -121,7 +121,7 @@ class SourceHandler {
     } else if (rest.endsWith("/")) {
       return sendFileListPage(box, rest);
     } else if (rest.endsWith(".java")) {
-      return makeSourcePage(box, rest, request.getQueryString(), logger);
+      return makeSourcePage(box, rest, request.getRequestURI().getQuery(), logger);
     } else {
       String strongName = getStrongNameFromSourcemapFilename(rest);
       if (strongName != null) {
@@ -144,7 +144,7 @@ class SourceHandler {
   }
 
   private Response makeSourceMapPage(final String moduleName, File sourceMap,
-      HttpServletRequest request) {
+      HttpExchange request) {
 
     // Stream the file, substituting the sourceroot variable with the filename.
     // (This is more efficient than parsing the file as JSON.)
@@ -153,8 +153,8 @@ class SourceHandler {
     // until we get a request. (For example, some people run the Code Server behind
     // a reverse proxy to support https.)
 
-    String sourceRoot = String.format("http://%s:%d/sourcemaps/%s/", request.getServerName(),
-        request.getServerPort(), moduleName);
+    String sourceRoot = String.format("http://%s/sourcemaps/%s/",
+        request.getRequestHeaders().getFirst("Host"), moduleName);
 
     final Response barePage = Responses.newTextTemplateResponse("application/json", sourceMap,
         "\"" + SOURCEROOT_TEMPLATE_VARIABLE + "\"",
@@ -211,47 +211,47 @@ class SourceHandler {
 
     return new Response() {
       @Override
-      public void send(HttpServletRequest request, HttpServletResponse response, TreeLogger logger)
-          throws IOException {
-        response.setStatus(HttpServletResponse.SC_OK);
-        response.setContentType("text/html");
+      public void send(HttpExchange exchange, TreeLogger logger) throws IOException {
+        exchange.getResponseHeaders().set("Content-Type", "text/html");
+        exchange.sendResponseHeaders(200, 0);
 
-        HtmlWriter out = new HtmlWriter(response.getWriter());
-        out.startTag("html").nl();
-        out.startTag("head").nl();
-        out.startTag("title").text(sourceFile.getName() + " (GWT Code Server)").endTag("title").nl();
-        out.startTag("style").nl();
-        out.text(".unused { color: grey; }").nl();
-        out.text(".used { color: black; }").nl();
-        out.text(".title { margin-top: 0; }").nl();
-        out.endTag("style").nl();
-        out.endTag("head").nl();
-        out.startTag("body").nl();
+        try (var writer = new PrintWriter(exchange.getResponseBody(), false, StandardCharsets.UTF_8)) {
+          HtmlWriter out = new HtmlWriter(writer);
+          out.startTag("html").nl();
+          out.startTag("head").nl();
+          out.startTag("title")
+              .text(sourceFile.getName() + " (GWT Code Server)")
+              .endTag("title")
+              .nl();
+          out.startTag("style").nl();
+          out.text(".unused { color: grey; }").nl();
+          out.text(".used { color: black; }").nl();
+          out.text(".title { margin-top: 0; }").nl();
+          out.endTag("style").nl();
+          out.endTag("head").nl();
+          out.startTag("body").nl();
 
-        out.startTag("a", "href=", ".").text(sourceFile.getParent()).endTag("a").nl();
-        out.startTag("h1", "class=", "title").text(sourceFile.getName()).endTag("h1").nl();
+          out.startTag("a", "href=", ".").text(sourceFile.getParent()).endTag("a").nl();
+          out.startTag("h1", "class=", "title").text(sourceFile.getName()).endTag("h1").nl();
 
-        out.startTag("pre", "class=", "unused").nl();
+          out.startTag("pre", "class=", "unused").nl();
 
-        BufferedReader lines = new BufferedReader(new InputStreamReader(pageBytes));
-        try {
-          int lineNumber = 1;
-          for (String line = lines.readLine(); line != null; line = lines.readLine()) {
-            if (sourceMap.appearsInJavaScript(sourcePath, lineNumber)) {
-              out.startTag("span", "class=", "used").text(line).endTag("span").nl();
-            } else {
-              out.text(line).nl();
+          try (BufferedReader lines = new BufferedReader(new InputStreamReader(pageBytes))) {
+            int lineNumber = 1;
+            for (String line = lines.readLine(); line != null; line = lines.readLine()) {
+              if (sourceMap.appearsInJavaScript(sourcePath, lineNumber)) {
+                out.startTag("span", "class=", "used").text(line).endTag("span").nl();
+              } else {
+                out.text(line).nl();
+              }
+              lineNumber++;
             }
-            lineNumber++;
           }
+          out.endTag("pre").nl();
 
-        } finally {
-          lines.close();
+          out.endTag("body").nl();
+          out.endTag("html").nl();
         }
-        out.endTag("pre").nl();
-
-        out.endTag("body").nl();
-        out.endTag("html").nl();
       }
     };
   }
